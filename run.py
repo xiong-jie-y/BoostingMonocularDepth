@@ -9,7 +9,8 @@ from utils import ImageandPatchs, ImageDataset, generatemask, getGF_fromintegral
 # MIDAS
 import midas.utils
 from midas.models.midas_net import MidasNet
-from midas.models.transforms import Resize, NormalizeImage, PrepareForNet
+import midas.models.transforms
+from dpt.transforms import Resize, NormalizeImage, PrepareForNet
 
 #AdelaiDepth
 from lib.multi_depth_model_woauxi import RelDepthModel
@@ -26,6 +27,8 @@ import cv2
 import numpy as np
 import argparse
 import warnings
+from dpt.models import DPTDepthModel
+
 warnings.simplefilter('ignore', np.RankWarning)
 
 # select device
@@ -37,6 +40,7 @@ pix2pixmodel = None
 midasmodel = None
 srlnet = None
 leresmodel = None
+dptmodel = None
 factor = None
 whole_size_threshold = 3000  # R_max from the paper
 GPU_threshold = 1600 - 32 # Limit for the GPU (NVIDIA RTX 2080), can be adjusted 
@@ -77,6 +81,20 @@ def run(dataset, option):
         torch.cuda.empty_cache()
         leresmodel.to(device)
         leresmodel.eval()
+    elif option.depthNet == 3:
+        global dptmodel
+        model_path = "dpt_large-midas-2f21e586.pt"
+        dptmodel = DPTDepthModel(
+            path=model_path,
+            backbone="vitl16_384",
+            non_negative=True,
+            enable_attention_hooks=False,
+        )
+        torch.cuda.empty_cache()
+        dptmodel.half()
+        dptmodel.to(device)
+        dptmodel.eval()
+
 
     # Generating required directories
     result_dir = option.output_dir
@@ -420,6 +438,8 @@ def singleestimate(img, msize, net_type):
         return estimatesrl(img, msize)
     elif net_type == 2:
         return estimateleres(img, msize)
+    elif net_type == 3:
+        return estimatedpt(img, msize)
 
 
 # Inference on SGRNet
@@ -450,10 +470,9 @@ def estimatesrl(img, msize):
 # Inference on MiDas-v2
 def estimatemidas(img, msize):
     # MiDas -v2 forward pass script adapted from https://github.com/intel-isl/MiDaS/tree/v2
-
     transform = Compose(
         [
-            Resize(
+            midas.models.transforms.Resize(
                 msize,
                 msize,
                 resize_target=None,
@@ -462,14 +481,15 @@ def estimatemidas(img, msize):
                 resize_method="upper_bound",
                 image_interpolation_method=cv2.INTER_CUBIC,
             ),
-            NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            PrepareForNet(),
+            midas.models.transforms.NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            midas.models.transforms.PrepareForNet(),
         ]
     )
 
     img_input = transform({"image": img})["image"]
 
     # Forward pass
+    
     with torch.no_grad():
         sample = torch.from_numpy(img_input).to(device).unsqueeze(0)
         prediction = midasmodel.forward(sample)
@@ -487,6 +507,61 @@ def estimatemidas(img, msize):
         prediction = 0
 
     return prediction
+
+def estimatedpt(img, msize):
+    normalization = NormalizeImage(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+
+    transform = Compose(
+        [
+            Resize(
+                msize,
+                msize,
+                resize_target=None,
+                keep_aspect_ratio=True,
+                ensure_multiple_of=32,
+                resize_method="upper_bound",
+                image_interpolation_method=cv2.INTER_CUBIC,
+            ),
+            normalization,
+            PrepareForNet(),
+        ]
+    )
+    img_input = transform({"image": img})["image"]
+
+    # Forward pass
+    with torch.no_grad():
+        sample = torch.from_numpy(img_input).to(device).unsqueeze(0)
+        sample = sample.to(memory_format=torch.channels_last)
+        sample = sample.half()
+        prediction = dptmodel.forward(sample)
+
+    prediction = (
+        torch.nn.functional.interpolate(
+            prediction.unsqueeze(1),
+            size=img.shape[:2],
+            mode="bicubic",
+            align_corners=False,
+        )
+        .squeeze()
+        .cpu()
+        .numpy()
+    )
+
+    # prediction = prediction.squeeze().cpu().numpy()
+    # prediction = cv2.resize(prediction, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_CUBIC)
+
+    # import IPython; IPython.embed()
+
+    # Normalization
+    depth_min = prediction.min()
+    depth_max = prediction.max()
+
+    if depth_max - depth_min > np.finfo("float").eps:
+        prediction = (prediction - depth_min) / (depth_max - depth_min)
+    else:
+        prediction = 0
+
+    return prediction.astype(np.float32)
 
 
 def scale_torch(img):
@@ -569,6 +644,9 @@ if __name__ == "__main__":
         option_.patch_netsize = 2*option_.net_receptive_field_size
     elif option_.depthNet == 2:
         option_.net_receptive_field_size = 448
+        option_.patch_netsize = 2 * option_.net_receptive_field_size
+    elif option_.depthNet == 3:
+        option_.net_receptive_field_size = 384
         option_.patch_netsize = 2 * option_.net_receptive_field_size
     else:
         assert False, 'depthNet can only be 0,1 or 2'
